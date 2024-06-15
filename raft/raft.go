@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -171,7 +172,7 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 
-	hs, _, err := c.Storage.InitialState()
+	hs, conf, err := c.Storage.InitialState()
 	if err != nil {
 		panic(err)
 	}
@@ -192,7 +193,7 @@ func newRaft(c *Config) *Raft {
 		PendingConfIndex: 0,
 	}
 
-	if hs.Commit < raft.RaftLog.committed || hs.Commit > raft.RaftLog.LastIndex() {
+	if hs.Commit < raft.RaftLog.committed {
 		panic("invalid hardstate commitIndex")
 	}
 	raft.RaftLog.committed = hs.Commit
@@ -201,7 +202,15 @@ func newRaft(c *Config) *Raft {
 		raft.RaftLog.applied = c.Applied
 	}
 
-	for _, peer := range c.peers {
+	// TODO: get nodes count not by conf.Nodes
+	// for _, peer := range c.peers {
+	// 	raft.Prs[uint64(peer)] = &Progress{
+	// 		Match: 0,
+	// 		Next:  0,
+	// 	}
+	// }
+
+	for _, peer := range conf.Nodes {
 		raft.Prs[uint64(peer)] = &Progress{
 			Match: 0,
 			Next:  0,
@@ -211,6 +220,10 @@ func newRaft(c *Config) *Raft {
 	raft.becomeFollower(raft.Term, None)
 
 	return raft
+}
+
+func (r *Raft) GetId() int {
+	return int(r.id)
 }
 
 func (r *Raft) SoftState() *SoftState {
@@ -298,7 +311,6 @@ func (r *Raft) appendEntries(entries ...*pb.Entry) {
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
-	// Your Code Here (2A).
 	if r.State == StateLeader {
 		r.tickHeartbeat()
 	} else {
@@ -360,6 +372,7 @@ func (r *Raft) bcastAppendEntries() {
 }
 
 func (r *Raft) startLeaderElection() {
+	log.Warnf("[id:%d term:%v] start leader election", r.id, r.Term)
 	r.becomeCandidate()
 
 	voteCnt := 0
@@ -438,7 +451,8 @@ func (r *Raft) becomeCandidate() {
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
-	// Your Code Here (2A).
+	log.Warnf("[id:%v term:%v] become leader", r.id, r.Term)
+
 	// NOTE: Leader should propose a noop entry on its term
 	if r.State == StateFollower {
 		panic("invalid transition [follower -> leader]")
@@ -473,6 +487,8 @@ func (r *Raft) send(m pb.Message) {
 	m.From = r.id
 	m.Term = r.Term
 	r.msgs = append(r.msgs, m)
+	log.Warnf("[id:%v term:%v] send %v to %v, msg: %v", r.id, r.Term, pb.MessageType_name[int32(m.MsgType)], m.To, ShowMsg(m))
+	// log.Warnf("[id:%v term:%v] send %v to %v, msg: %v, current log: %v", r.id, r.Term, pb.MessageType_name[int32(m.MsgType)], m.To, ShowMsg(m), r.RaftLog)
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -517,7 +533,7 @@ func (r *Raft) Step(m pb.Message) error {
 				To:      m.From,
 				Reject:  false,
 			})
-
+			log.Warnf("[id:%v term:%v] vote for %v", r.id, r.Term, m.From)
 			return nil
 		}
 
@@ -547,6 +563,9 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		r.bcastHeartbeat()
 
 	case pb.MessageType_MsgPropose:
+		if len(m.Entries) == 0 {
+			log.Errorf("[id:%v term:%v] stepped empty MsgPropose", r.id, r.Term)
+		}
 		r.appendEntries(m.Entries...)
 		r.bcastAppendEntries()
 
@@ -569,10 +588,12 @@ func (r *Raft) stepFollower(m pb.Message) error {
 
 	case pb.MessageType_MsgAppend:
 		r.Lead = m.From
+		r.electionElapsed = 0
 		r.handleAppendEntries(m)
 
 	case pb.MessageType_MsgHeartbeat:
 		r.Lead = m.From
+		r.electionElapsed = 0
 		r.handleHeartbeat(m)
 	default:
 	}
@@ -596,7 +617,7 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 				rejectCnt++
 			}
 		}
-
+		log.Warnf("[id:%v term:%v] receive %v votes and %v rejects", r.id, r.Term, voteCnt, rejectCnt)
 		if voteCnt > len(r.Prs)/2 {
 			r.becomeLeader()
 		}
@@ -707,6 +728,7 @@ func (r *Raft) tryUpdateCommitIndex(bcastAppendAfterUpdateCommit bool) {
 	N := matchIndexs[(len(matchIndexs)-1)/2]
 	if entry, exist := r.RaftLog.EntryAt(N); exist && N > r.RaftLog.committed && r.Term == entry.Term {
 		r.RaftLog.committed = N
+		log.Warnf("[id:%v term:%v] update CommitIndex to %v", r.id, r.Term, r.RaftLog.committed)
 		if bcastAppendAfterUpdateCommit {
 			r.bcastAppendEntries()
 		}
@@ -720,12 +742,15 @@ func (r *Raft) handleAppendEntriesResp(m pb.Message) {
 
 	if m.Reject {
 		r.Prs[m.From].Next--
+		log.Warnf("update [%v]'s Progress{Match: %v, Next: %v}", m.From, r.Prs[m.From].Match, r.Prs[m.From].Next)
 		r.sendAppend(m.From)
 		return
 	}
 
 	r.Prs[m.From].Match = max(r.Prs[m.From].Match, m.Index)
 	r.Prs[m.From].Next = max(r.Prs[m.From].Next, m.Index+1)
+
+	log.Warnf("[id:%v term:%v] update [%v]'s Progress{Match: %v, Next: %v}", r.id, r.Term, m.From, r.Prs[m.From].Match, r.Prs[m.From].Next)
 
 	// update committed index
 	r.tryUpdateCommitIndex(true)
